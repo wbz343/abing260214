@@ -1,0 +1,38 @@
+name: Auto Update BPB Panel
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 2 * * *'   # 每天 UTC 2:00（北京时间上午10点）检查更新
+  workflow_dispatch:      # 允许手动触发
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download latest BPB worker.zip
+        run: |
+          # 获取最新 release 的 worker.zip
+          LATEST=$(curl -s https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases/latest | jq -r .tag_name)
+          echo "Latest version: $LATEST"
+          curl -L -o worker.zip https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/latest/download/worker.zip
+
+      - name: Extract and prepare
+        run: |
+          unzip -o worker.zip
+          # 如果有 _worker.js 就放到根目录（Pages 需要）
+          if [ -f "_worker.js" ]; then
+            mv _worker.js .
+          fi
+          # 可选：自己再混淆一次（需要安装 javascript-obfuscator）
+          # npm install -g javascript-obfuscator
+          # javascript-obfuscator _worker.js --output _worker.js --compact true --self-defending true
+
+      - name: Commit changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: auto update BPB to ${{ env.LATEST }}"
+          file_pattern: .
