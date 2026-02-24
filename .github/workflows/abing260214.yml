@@ -30,11 +30,11 @@ jobs:
         run: |
           if [ -f "current_version.txt" ]; then
             CURRENT=$(cat current_version.txt)
-            if [ "\( CURRENT" = " \){{ env.LATEST_TAG }}" ]; then
-              echo "Already latest version ${{ env.LATEST_TAG }} - skipping update"
+            if [ "$CURRENT" = "$LATEST_TAG" ]; then
+              echo "Already latest version $LATEST_TAG - skipping update"
               echo "skip=true" >> $GITHUB_OUTPUT
             else
-              echo "New version available: ${{ env.LATEST_TAG }}"
+              echo "New version available: $LATEST_TAG"
               echo "skip=false" >> $GITHUB_OUTPUT
             fi
           else
@@ -54,19 +54,37 @@ jobs:
           rm -rf extracted
           mkdir extracted
           unzip -o worker.zip -d extracted
-          # 移动关键文件到根目录（Pages 期望 _worker.js 在根）
-          find extracted -type f \( -name "_worker.js" -o -name "index.html" -o -name "*.js" -o -name "*.css" -o -name "*.html" \) -exec mv {} . \;
-          # 可选：删除不必要的文件/文件夹（视情况）
+          
+          # 创建备份并安全移动文件
+          # 只移动 worker.js 相关文件，避免覆盖其他重要文件
+          if [ -f "extracted/_worker.js" ]; then
+            cp extracted/_worker.js .
+          fi
+          
+          # 如果有其他特定文件需要更新
+          for file in extracted/*.html extracted/*.js extracted/*.css; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              cp "$file" "./$filename"
+            fi
+          done
+          
+          # 清理临时文件
           rm -rf extracted worker.zip
+          
           # 保存版本号用于下次比较
-          echo "${{ env.LATEST_TAG }}" > current_version.txt
+          echo "$LATEST_TAG" > current_version.txt
 
       - name: Commit and push changes (only if updated)
         if: steps.check_update.outputs.skip != 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: auto-update BPB Panel to ${{ env.LATEST_TAG }}"
-          file_pattern: .
+          file_pattern: |
+            *.js
+            *.html
+            *.css
+            current_version.txt
           branch: main
           skip_dirty_check: false
           skip_fetch: true
