@@ -2,98 +2,173 @@ name: Auto Update BPB Panel to Latest
 
 on:
   schedule:
-    - cron: '15 3 * * *'          # 每天 UTC 3:15（北京/新加坡时间上午11:15），避开高峰
-  workflow_dispatch:              # 支持手动触发
+    # 每天 UTC 时间 03:15 运行（北京时间 11:15）
+    - cron: '15 3 * * *'
+  
+  # 支持手动触发
+  workflow_dispatch:
+  
+  # 当更新本工作流文件时也触发
   push:
     branches: [ main ]
     paths:
-      - '.github/workflows/update-bpb.yml'  # 只在修改本文件时触发，避免无关 push
+      - '.github/workflows/update-bpb.yml'
 
 jobs:
   update-and-deploy:
     runs-on: ubuntu-latest
+    
     steps:
+      # 步骤 1: 检出代码
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}   # 必须用 GITHUB_TOKEN 才有 push 权限
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0  # 获取完整历史记录
 
+      # 步骤 2: 设置 Git 身份信息（用于后续提交）
+      - name: Setup Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      # 步骤 3: 获取最新版本标签
       - name: Get latest release tag
         id: get_version
         run: |
-          LATEST_TAG=$(curl -s https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases/latest | jq -r .tag_name)
+          # 使用 GitHub API 获取最新发布版本
+          LATEST_TAG=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases/latest \
+            | grep '"tag_name"' | cut -d '"' -f 4)
+          
+          if [ -z "$LATEST_TAG" ]; then
+            echo "❌ Failed to get latest tag"
+            exit 1
+          fi
+          
           echo "LATEST_TAG=$LATEST_TAG" >> $GITHUB_ENV
           echo "Latest BPB version: $LATEST_TAG"
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
 
+      # 步骤 4: 检查是否需要更新
       - name: Check if already up-to-date
         id: check_update
         run: |
+          # 检查当前版本记录文件
           if [ -f "current_version.txt" ]; then
-            CURRENT=$(cat current_version.txt)
-            if [ "$CURRENT" = "$LATEST_TAG" ]; then
-              echo "Already latest version $LATEST_TAG - skipping update"
-              echo "skip=true" >> $GITHUB_OUTPUT
+            CURRENT_VERSION=$(cat current_version.txt)
+            echo "Current version: $CURRENT_VERSION"
+            echo "Latest version: $LATEST_TAG"
+            
+            if [ "$CURRENT_VERSION" = "$LATEST_TAG" ]; then
+              echo "✅ Already at latest version ($LATEST_TAG)"
+              echo "skip_update=true" >> $GITHUB_OUTPUT
+              echo "update_needed=false" >> $GITHUB_OUTPUT
+              exit 0
             else
-              echo "New version available: $LATEST_TAG"
-              echo "skip=false" >> $GITHUB_OUTPUT
+              echo "📦 Update available: $CURRENT_VERSION -> $LATEST_TAG"
+              echo "skip_update=false" >> $GITHUB_OUTPUT
+              echo "update_needed=true" >> $GITHUB_OUTPUT
             fi
           else
-            echo "No previous version record - proceeding"
-            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "📝 No version record found. First-time setup."
+            echo "skip_update=false" >> $GITHUB_OUTPUT
+            echo "update_needed=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: Download latest worker.zip (if needed)
-        if: steps.check_update.outputs.skip != 'true'
+      # 步骤 5: 下载最新发布包
+      - name: Download latest release
+        if: steps.check_update.outputs.skip_update == 'false'
         run: |
-          curl -L -o worker.zip https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/latest/download/worker.zip
-          ls -lh worker.zip
-
-      - name: Extract and clean
-        if: steps.check_update.outputs.skip != 'true'
-        run: |
-          rm -rf extracted
-          mkdir extracted
-          unzip -o worker.zip -d extracted
+          echo "Downloading worker.zip from release $LATEST_TAG..."
           
-          # 创建备份并安全移动文件
-          # 只移动 worker.js 相关文件，避免覆盖其他重要文件
-          if [ -f "extracted/_worker.js" ]; then
-            cp extracted/_worker.js .
+          # 下载 worker.zip
+          curl -s -L -o worker.zip \
+            "https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/$LATEST_TAG/worker.zip"
+          
+          # 验证下载是否成功
+          if [ ! -f "worker.zip" ]; then
+            echo "❌ Failed to download worker.zip"
+            exit 1
           fi
           
-          # 如果有其他特定文件需要更新
-          for file in extracted/*.html extracted/*.js extracted/*.css; do
-            if [ -f "$file" ]; then
-              filename=$(basename "$file")
-              cp "$file" "./$filename"
+          # 显示文件信息
+          FILE_SIZE=$(ls -lh worker.zip | awk '{print $5}')
+          echo "✅ Downloaded worker.zip ($FILE_SIZE)"
+
+      # 步骤 6: 提取并部署文件
+      - name: Extract and deploy
+        if: steps.check_update.outputs.skip_update == 'false'
+        run: |
+          echo "Extracting worker.zip..."
+          
+          # 创建临时目录
+          EXTRACT_DIR="bpb_extracted_$(date +%s)"
+          mkdir -p "$EXTRACT_DIR"
+          
+          # 解压文件
+          if ! unzip -q worker.zip -d "$EXTRACT_DIR"; then
+            echo "❌ Failed to extract worker.zip"
+            exit 1
+          fi
+          
+          echo "Contents of extracted directory:"
+          find "$EXTRACT_DIR" -type f | head -20
+          
+          # 查找并复制文件到正确位置
+          echo "Copying files to repository root..."
+          
+          # 复制所有文件（保持目录结构）
+          if [ -d "$EXTRACT_DIR" ]; then
+            # 使用 rsync 复制文件，保留目录结构
+            if command -v rsync &> /dev/null; then
+              rsync -av "$EXTRACT_DIR"/ ./
+            else
+              cp -r "$EXTRACT_DIR"/* ./
             fi
-          done
+          fi
           
           # 清理临时文件
-          rm -rf extracted worker.zip
+          rm -rf "$EXTRACT_DIR" worker.zip
           
-          # 保存版本号用于下次比较
+          # 保存版本信息
           echo "$LATEST_TAG" > current_version.txt
+          
+          # 列出更新的文件
+          echo "✅ Updated files:"
+          git status --porcelain || true
 
-      - name: Commit and push changes (only if updated)
-        if: steps.check_update.outputs.skip != 'true'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore: auto-update BPB Panel to ${{ env.LATEST_TAG }}"
-          file_pattern: |
-            *.js
-            *.html
-            *.css
-            current_version.txt
-          branch: main
-          skip_dirty_check: false
-          skip_fetch: true
-          skip_checkout: true
-
-      - name: Log result
+      # 步骤 7: 提交更改
+      - name: Commit changes
+        if: steps.check_update.outputs.skip_update == 'false'
         run: |
-          if [ "${{ steps.check_update.outputs.skip }}" = "true" ]; then
-            echo "No update needed."
-          else
-            echo "Updated to ${{ env.LATEST_TAG }} and committed."
+          # 检查是否有更改
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "⚠️ No changes to commit"
+            exit 0
           fi
+          
+          # 添加所有更改的文件
+          git add .
+          
+          # 提交更改
+          git commit -m "🔧 chore: auto-update BPB Panel to $LATEST_TAG [skip ci]"
+          
+          # 推送更改
+          echo "Pushing changes to main branch..."
+          git push origin main
+
+      # 步骤 8: 更新结果总结
+      - name: Update summary
+        run: |
+          if [ "${{ steps.check_update.outputs.skip_update }}" = "true" ]; then
+            echo "📊 **Summary:** No update needed."
+            echo "✅ Already at latest version: $LATEST_TAG"
+          else
+            echo "📊 **Summary:** Update completed successfully!"
+            echo "✅ Updated from: ${{ steps.check_update.outputs.current_version || 'N/A' }}"
+            echo "✅ Updated to: $LATEST_TAG"
+            echo "✅ Changes committed and pushed to main branch"
+          fi
+          
+          echo "🕒 Next auto-update: UTC 03:15 daily"
